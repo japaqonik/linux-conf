@@ -1,0 +1,173 @@
+#!/bin/sh
+# tmux status-right widget: fill level of one or more filesystems.
+#
+# Renders colour-blocked segments separated by a half-block glyph, so it reads
+# like a powerline bar but needs no patched font (U+258C is in almost every
+# monospace font).
+#
+# WHAT IS MEASURED
+#   df, i.e. the filesystem *containing* each directory -- not the size of the
+#   directory itself. Two configured paths on the same filesystem therefore
+#   report identical figures, so duplicates are collapsed and only the first
+#   label is shown. Per-directory consumption would need du, which has no
+#   percentage to report and is far too slow to run from a status bar.
+#
+# CONFIGURATION (tmux user options; all optional)
+#   @disk_paths     list of "label=directory" pairs, whitespace separated.
+#                   A bare directory uses its basename as the label.
+#                   A leading ~ is expanded. Labels may not contain spaces.
+#                   Paths containing spaces are not supported.
+#                     set -g @disk_paths "local=/local home=~"
+#   @disk_warn      percent at which a segment turns amber   (default 80)
+#   @disk_crit      percent at which a segment turns red     (default 90)
+#   @disk_bar_bg    background of the status bar itself      (default: status-bg)
+#   @disk_next_bg   background of the segment that follows   (default 240)
+#
+# Options may also be given as arguments, which override @disk_paths:
+#   tmux-disk local=/local home=~ /var
+#
+# Colours of the three fill bands are constants below; everything that has to
+# agree with the rest of the status line is read from tmux instead.
+
+OK_BG=236;   OK_FG=252     # healthy
+WARN_BG=214; WARN_FG=16    # at or above @disk_warn
+CRIT_BG=160; CRIT_FG=231   # at or above @disk_crit
+RULE_FG=244                # divider between two same-coloured segments
+
+# Read a tmux option, falling back to $2 when unset or when not inside tmux.
+opt() {
+        _v=$(tmux show -gv "$1" 2>/dev/null) || _v=''
+        [ -n "$_v" ] || _v=$2
+        printf '%s' "$_v"
+}
+
+# Turn 238 into colour238 while leaving names, hex and "default" untouched.
+colourise() {
+        case $1 in
+        '' | *[!0-9]*) printf '%s' "$1" ;;
+        *) printf 'colour%s' "$1" ;;
+        esac
+}
+
+paths=$*
+[ -n "$paths" ] || paths=$(opt @disk_paths 'root=/ home=~')
+warn=$(opt @disk_warn 80)
+crit=$(opt @disk_crit 90)
+next_bg=$(colourise "$(opt @disk_next_bg 240)")
+
+# The seam glyph has to be drawn in the bar's own background colour, so ask
+# tmux for it rather than keeping a second copy here. status-bg wins when set;
+# otherwise fall back to the bg= field of status-style, which is where current
+# tmux keeps it.
+bar_raw=$(opt @disk_bar_bg '')
+if [ -z "$bar_raw" ]; then
+        bar_raw=$(opt status-bg '')
+        case $bar_raw in
+        '' | default)
+                bar_raw=$(opt status-style '' | sed -n 's/.*bg=\([^,]*\).*/\1/p')
+                ;;
+        esac
+fi
+[ -n "$bar_raw" ] || bar_raw=238
+bar_bg=$(colourise "$bar_raw")
+
+# `timeout` guards against a stalled network mount hanging the status bar. It
+# is GNU coreutils, so fall back to a bare df where it is unavailable.
+if command -v timeout >/dev/null 2>&1; then
+        df_k() { timeout 2 df -Pk "$1"; }
+else
+        df_k() { df -Pk "$1"; }
+fi
+
+# One df per path: a path that cannot be queried drops out on its own instead
+# of shifting every later column. -Pk forces 1024-byte blocks, which POSIX df
+# does not otherwise guarantee (BSD defaults to 512).
+rows=$(
+        for spec in $paths; do
+                case $spec in
+                *=*)
+                        label=${spec%%=*}
+                        dir=${spec#*=}
+                        ;;
+                *)
+                        dir=$spec
+                        label=''
+                        ;;
+                esac
+
+                case $dir in
+                '~') dir=$HOME ;;
+                '~/'*) dir=$HOME/${dir#'~/'} ;;
+                esac
+
+                [ -d "$dir" ] || continue
+
+                if [ -z "$label" ]; then
+                        if [ "$dir" = / ]; then label=root; else label=$(basename "$dir"); fi
+                fi
+
+                df_k "$dir" 2>/dev/null |
+                        awk -v label="$label" 'NR == 2 { gsub(/%/, "", $5); print label, $5, $4, $6 }'
+        done
+)
+
+printf '%s\n' "$rows" | awk \
+        -v bar="$bar_bg" -v nxt="$next_bg" \
+        -v warn="$warn" -v crit="$crit" \
+        -v okbg="$OK_BG" -v okfg="$OK_FG" \
+        -v wnbg="$WARN_BG" -v wnfg="$WARN_FG" \
+        -v crbg="$CRIT_BG" -v crfg="$CRIT_FG" -v rulefg="$RULE_FG" '
+BEGIN {
+        n = 0
+        # Octal rather than \x: hex escapes are a GNU/mawk extension that the
+        # original-awk shipped as /usr/bin/awk on some systems does not accept.
+        glyph = "\342\226\214"  # U+258C LEFT HALF BLOCK - colour transition
+        rule  = "\342\224\202"  # U+2502 LIGHT VERTICAL  - divider inside one colour
+}
+
+function colour(c) {
+        return (c ~ /^[0-9]+$/) ? "colour" c : c
+}
+
+# Divider between two segments. A half-block blends two different colours; if
+# both sides share a colour that would be invisible, so draw a thin rule.
+function edge(from, to) {
+        if (from == to)
+                return sprintf("#[fg=%s,bg=%s]%s", colour(rulefg), to, rule)
+        return sprintf("#[fg=%s,bg=%s]%s", from, to, glyph)
+}
+
+NF < 4 { next }
+{
+        mount = $4
+        if (seen[mount]++)      # already shown under an earlier label
+                next
+
+        pct    = $2 + 0
+        availg = $3 / 1048576
+
+        n++
+        label[n] = $1
+        if (pct >= crit)      { bg[n] = colour(crbg); fg[n] = colour(crfg); bold[n] = ",bold" }
+        else if (pct >= warn) { bg[n] = colour(wnbg); fg[n] = colour(wnfg); bold[n] = ",bold" }
+        else                  { bg[n] = colour(okbg); fg[n] = colour(okfg); bold[n] = ""      }
+
+        text[n] = sprintf("%s %d%% %s", label[n],
+                          pct, (availg < 10) ? sprintf("%.1fG", availg) \
+                                             : sprintf("%dG", availg))
+}
+
+END {
+        # With nothing to report still emit the seam, so the status line does not
+        # gain a hard colour jump where the widget used to be.
+        if (n == 0) {
+                printf "%s", edge(bar, nxt)
+                exit
+        }
+        printf "%s", edge(bar, bg[1])
+        for (i = 1; i <= n; i++) {
+                printf "#[fg=%s,bg=%s%s] %s ", fg[i], bg[i], bold[i], text[i]
+                printf "%s", edge(bg[i], (i < n) ? bg[i + 1] : nxt)
+        }
+}'
+
